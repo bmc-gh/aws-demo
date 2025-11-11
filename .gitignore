@@ -1,0 +1,65 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+terraform/*.tfvars
+terraform/state-infra/*.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Terraform plan output
+*.tfplan
+
+# Generated backend configuration (created by first_time_deploy.sh)
+terraform/backend.tf
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+dist/
+build/
+*.zip
+
+# AWS
+.aws/
+
+# GitHub Actions
+.github/workflows/secrets.yml
+
+# Sensitive files
+*.pem
+*.key
+*.crt
+credentials
+secrets.yaml
+secrets.yml
+secrets.json
+
+# OS specific
+Thumbs.db
+.DS_Store
+
+# Backup files
+*.bak
+*.backup
+*~

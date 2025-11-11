@@ -1,0 +1,235 @@
+name: Deploy Infrastructure 
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/deploy-infra.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'eus-dev'
+        type: choice
+        options:
+          - eus-dev
+          - eus-staging
+          - eus-prod
+          - wus-dev
+          - wus-staging
+          - wus-prod
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.13.5'
+  AWS_REGION: 'us-east-1'
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'eus-dev' }}
+
+jobs:
+  validate-and-plan:
+    name: Validate and Plan
+    runs-on: ubuntu-latest
+    outputs:
+      changes_count: ${{ steps.plan.outputs.changes_count }}
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          # Initialize with backend config file for the environment
+          terraform init -backend-config=backend-config/${{ env.ENVIRONMENT }}.tfbackend
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: Run Terraform Tests
+        id: test
+        run: |
+          # Terraform test automatically discovers all *.tftest.hcl files recursively
+          terraform test -verbose
+        continue-on-error: true
+
+      - name: Run tfsec Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform
+          soft_fail: true
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -out=tfplan \
+            -var-file="tfvars/${{ env.ENVIRONMENT }}.tfvars" \
+            -var="alarm_email_addresses=[\"${{ secrets.ALARM_EMAIL }}\"]"
+
+          # Check if there are any changes
+          terraform show -json tfplan > plan.json
+
+          # Count resources to be added, changed, or destroyed
+          CHANGES=$(jq -r '[.resource_changes[]? | select(.change.actions | contains(["create"]) or contains(["update"]) or contains(["delete"]))] | length' plan.json)
+          echo "changes_count=${CHANGES}" >> $GITHUB_OUTPUT
+
+          if [ "$CHANGES" -eq 0 ]; then
+            echo "::notice::No infrastructure changes detected"
+          else
+            echo "::warning::${CHANGES} resource(s) will be modified. Manual approval required."
+          fi
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform/tfplan
+          retention-days: 5
+
+      - name: Upload Plan JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-json
+          path: terraform/plan.json
+          retention-days: 5
+
+  manual-approval:
+    name: Manual Approval Required
+    runs-on: ubuntu-latest
+    needs: validate-and-plan
+    if: |
+      needs.validate-and-plan.outputs.changes_count != '0' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+    environment:
+      name: approval-${{ github.event.inputs.environment || 'eus-dev' }}
+    steps:
+      - name: Download Plan JSON
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-json
+
+      - name: Display Plan Summary
+        run: |
+          echo "## 🔍 Infrastructure Changes Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment || 'eus-dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Parse and display changes
+          jq -r '
+            .resource_changes[]? |
+            select(.change.actions | contains(["create"]) or contains(["update"]) or contains(["delete"])) |
+            "- **\(.change.actions | join(", "))**: `\(.address)`"
+          ' plan.json >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Approval granted to proceed with deployment" >> $GITHUB_STEP_SUMMARY
+
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [validate-and-plan, manual-approval]
+    if: |
+      always() &&
+      needs.validate-and-plan.result == 'success' &&
+      (needs.manual-approval.result == 'success' || needs.manual-approval.result == 'skipped')
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          # Initialize with backend config file for the environment
+          terraform init -backend-config=backend-config/${{ env.ENVIRONMENT }}.tfbackend
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform/
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: outputs
+        run: |
+          echo "app_url=$(terraform output -raw application_url)" >> $GITHUB_OUTPUT
+          echo "cluster_name=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
+          echo "service_name=$(terraform output -raw ecs_service_name)" >> $GITHUB_OUTPUT
+          echo "ecr_repo=$(terraform output -raw ecr_repository_url 2>/dev/null || echo 'not-created')" >> $GITHUB_OUTPUT
+
+      - name: Save Outputs
+        run: terraform output -json > outputs.json
+
+      - name: Upload Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: terraform/outputs.json
+          retention-days: 30
+
+      - name: Deployment Summary
+        run: |
+          echo "## Infrastructure Deployed! :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resources Created" >> $GITHUB_STEP_SUMMARY
+          echo "- **Application URL**: ${{ steps.outputs.outputs.app_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster**: ${{ steps.outputs.outputs.cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service**: ${{ steps.outputs.outputs.service_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Deploy application: Trigger 'Deploy Application' workflow" >> $GITHUB_STEP_SUMMARY
+          echo "2. Check your email to confirm SNS subscription" >> $GITHUB_STEP_SUMMARY
+          echo "3. Monitor CloudWatch dashboards for metrics" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,8 @@
+# Backend configuration for eus-staging environment
+# Usage: terraform init -backend-config=backend-config/eus-staging.tfbackend
+
+bucket         = "terraform-state-978794836516-8f2db2"
+key            = "eus-staging/terraform.tfstate"
+region         = "us-east-1"
+encrypt        = true
+dynamodb_table = "terraform-state-lock"

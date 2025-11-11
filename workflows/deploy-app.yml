@@ -1,0 +1,171 @@
+name: Deploy Application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - '.github/workflows/deploy-app.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: 'us-east-1'
+  ECR_REPOSITORY: 'aws-platform-demo'
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Container
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get or Create ECR Repository
+        id: ecr
+        run: |
+          # Try to describe the repository
+          if aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Repository exists"
+          else
+            echo "Creating ECR repository..."
+            aws ecr create-repository \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256 \
+              --region ${{ env.AWS_REGION }}
+          fi
+
+          REPO_URI=$(aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} --query 'repositories[0].repositoryUri' --output text)
+          echo "repository_uri=$REPO_URI" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.repository_uri }}:latest
+            ${{ steps.ecr.outputs.repository_uri }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr.outputs.repository_uri }}:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Update ECS Service
+        id: deploy
+        run: |
+          # Get cluster and service names from Terraform outputs or use defaults
+          CLUSTER_NAME=$(aws ecs list-clusters --region ${{ env.AWS_REGION }} --query 'clusterArns[0]' --output text | cut -d'/' -f2)
+          SERVICE_NAME=$(aws ecs list-services --cluster $CLUSTER_NAME --region ${{ env.AWS_REGION }} --query 'serviceArns[0]' --output text | cut -d'/' -f3)
+
+          if [ -n "$CLUSTER_NAME" ] && [ -n "$SERVICE_NAME" ] && [ "$CLUSTER_NAME" != "None" ] && [ "$SERVICE_NAME" != "None" ]; then
+            echo "Updating ECS service: $SERVICE_NAME in cluster: $CLUSTER_NAME"
+            echo "cluster=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+            echo "service=$SERVICE_NAME" >> $GITHUB_OUTPUT
+
+            aws ecs update-service \
+              --cluster $CLUSTER_NAME \
+              --service $SERVICE_NAME \
+              --force-new-deployment \
+              --region ${{ env.AWS_REGION }}
+
+            echo "Waiting for service to stabilize..."
+            aws ecs wait services-stable \
+              --cluster $CLUSTER_NAME \
+              --services $SERVICE_NAME \
+              --region ${{ env.AWS_REGION }}
+
+            echo "Service updated successfully!"
+            echo "deployed=true" >> $GITHUB_OUTPUT
+          else
+            echo "ECS service not found. Infrastructure may not be deployed yet."
+            echo "Please run 'Deploy Infrastructure' workflow first."
+            echo "deployed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Get Application URL
+        if: steps.deploy.outputs.deployed == 'true'
+        id: app_url
+        run: |
+          # Get ALB DNS name
+          CLUSTER_NAME="${{ steps.deploy.outputs.cluster }}"
+          SERVICE_ARN=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services ${{ steps.deploy.outputs.service }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].serviceArn' \
+            --output text)
+
+          # Get target group from service
+          TG_ARN=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services ${{ steps.deploy.outputs.service }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].loadBalancers[0].targetGroupArn' \
+            --output text)
+
+          # Get ALB from target group
+          ALB_ARN=$(aws elbv2 describe-target-groups \
+            --target-group-arns $TG_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'TargetGroups[0].LoadBalancerArns[0]' \
+            --output text)
+
+          # Get ALB DNS name
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns $ALB_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "url=http://$ALB_DNS" >> $GITHUB_OUTPUT
+
+      - name: Deployment Summary
+        if: steps.deploy.outputs.deployed == 'true'
+        run: |
+          echo "## Application Deployed! :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Container Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ steps.ecr.outputs.repository_uri }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: \`latest\`, \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster**: ${{ steps.deploy.outputs.cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service**: ${{ steps.deploy.outputs.service }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Access Application" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: ${{ steps.app_url.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
